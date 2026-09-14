@@ -12,7 +12,8 @@
 const DEFAULTS = {
   baseUrl: 'https://api.openai.com/v1',
   model: 'gpt-4o-mini',
-  maxContextChars: 80000
+  maxContextChars: 80000,
+  maxSteps: 40
 };
 
 export async function getLlmConfig() {

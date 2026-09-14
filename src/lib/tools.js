@@ -51,7 +51,7 @@ export const BROWSER_TOOLS = [
     function: {
       name: 'browser_type',
       description:
-        'Type text into an input or textarea identified by its [N] ref. Clears the field first, then types the given text.',
+        'Type text into an <input>, <textarea> or contenteditable identified by its [N] ref. Clears the field first. This sets the element value directly, so it only works on genuinely editable elements — if it returns "Element is not editable" the target is a terminal, canvas or custom editor, and you must use browser_send_keys instead (click the element first to focus it).',
       parameters: {
         type: 'object',
         properties: {
@@ -69,8 +69,39 @@ export const BROWSER_TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'browser_read_terminal',
+      description:
+        'Read the visible buffer of a terminal in the FOCUS FRAME (xterm.js or term.js/tty.js). Use this instead of guessing CSS selectors after running a command — terminal internals differ per renderer and selector-guessing does not converge. If it reports renderer "xterm-canvas", the output is drawn to a <canvas> and genuinely cannot be read from the DOM by any selector: stop trying, and instead redirect the command output to a file and read that file from a terminal you can read.',
+      parameters: {
+        type: 'object',
+        properties: {
+          maxChars: { type: 'integer', description: 'Max characters of the tail to return (default 4000).' }
+        }
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_send_keys',
+      description:
+        'Type text as REAL keyboard input into whatever currently has focus in the FOCUS tab. The typed text is READ BACK and verified before Enter is pressed: if the characters that landed do not match what was sent, Enter is withheld, the line is cleared, and it retries more slowly — so a mangled command is never executed. Check the `verified` field: true means the text was confirmed on screen, null means the target could not be read back (canvas terminal) and the result is unconfirmed. This is the only way to drive terminals (lab consoles, xterm/term.js), code editors and canvas apps: they ignore synthetic events, so browser_type will fail on them with "Element is not editable" or appear to do nothing. Workflow: browser_click the terminal/editor area to focus it, then browser_send_keys with the command and submit:true. Verify with a snapshot afterwards — never assume a command ran. For ordinary <input>/<textarea> form fields, browser_type is still simpler and faster.',
+      parameters: {
+        type: 'object',
+        properties: {
+          text: { type: 'string', description: 'Text to type, character by character.' },
+          submit: { type: 'boolean', description: 'Press Enter afterwards (default false). Use true to run a shell command.' },
+          delayMs: { type: 'integer', description: 'Milliseconds between keystrokes (default 15). Raise it if a target proves lossy.' }
+        },
+        required: ['text']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'browser_press_key',
-      description: 'Press a keyboard key (Enter, Tab, Escape, ArrowDown, ArrowUp, etc.).',
+      description: 'Press a single key, or a chord, as real input to whatever has focus in the FOCUS tab. Accepts one character ("a", "/"), a named key ("Enter", "Escape", "F5", "ArrowDown", "PageUp"), or modifiers joined with + ("Ctrl+C", "Ctrl+Shift+P", "Alt+F4"). Anything it cannot faithfully produce is REJECTED with ok:false rather than silently doing nothing. To type a whole string use browser_send_keys instead. Note that keys do not scroll a page that is not focused on its scroll container — to read more text use browser_page_text with an offset.',
       parameters: {
         type: 'object',
         properties: {
@@ -84,7 +115,7 @@ export const BROWSER_TOOLS = [
     type: 'function',
     function: {
       name: 'browser_scroll',
-      description: 'Scroll the current viewport up or down by roughly the given amount in pixels.',
+      description: 'Scroll the FOCUS FRAME up or down by roughly the given amount in pixels. It finds the element that actually scrolls (often an inner container, not the document) and reports scrollTop/scrollHeight/atTop/atBottom plus whether anything moved. Scrolling is for triggering lazy-loaded content or bringing a control into view — it does NOT reveal more text to browser_page_text, which always returns the whole document.',
       parameters: {
         type: 'object',
         properties: {
@@ -110,7 +141,7 @@ export const BROWSER_TOOLS = [
           },
           attr: {
             type: 'string',
-            description: 'Attribute name. Omit or set "" for visible text.'
+            description: 'One of: innerText, textContent, innerHTML, outerHTML, value, or a plain HTML attribute name (href, id, src...). Omit or set "" for visible text. JS property paths like "parentElement.outerHTML" are NOT supported and are rejected — write a CSS selector that reaches the element instead. A null value means the attribute is absent.'
           },
           limit: { type: 'integer', description: 'Max number of items (default 20).' }
         },
@@ -139,7 +170,11 @@ export const BROWSER_TOOLS = [
             type: 'string',
             description: 'Attribute name. Omit or set "" for visible text.'
           },
-          limit: { type: 'integer', description: 'Max number of items (default 20).' }
+          limit: { type: 'integer', description: 'Max number of items (default 20).' },
+          frameId: {
+            type: 'integer',
+            description: 'Frame within that tab (default 0 = top document). If the tab content lives in an iframe, frame 0 usually returns only the outer shell.'
+          }
         },
         required: ['tabId', 'selector']
       }
@@ -150,7 +185,7 @@ export const BROWSER_TOOLS = [
     function: {
       name: 'browser_page_text',
       description:
-        'Get the main textual content of the FOCUS tab (cleaned, similar to a reader view). Use this when you need a long page summarized in chat or to compare two pages.',
+        'Get the readable text of the FOCUS FRAME (cleaned, reader-view style). It returns the WHOLE document every time, independent of scroll position — scrolling and then calling this again gives byte-identical output, so never do that. For long pages, read the first chunk, then call again with offset set to the nextOffset value from the previous result. The result reports offset, returnedChars, totalChars and nextOffset.',
       parameters: {
         type: 'object',
         properties: {
@@ -160,7 +195,15 @@ export const BROWSER_TOOLS = [
           },
           maxChars: {
             type: 'integer',
-            description: 'Max characters to return (default 6000).'
+            description: 'Max characters to return per call (default 6000, cap 30000).'
+          },
+          offset: {
+            type: 'integer',
+            description: 'Character offset to start from. Pass the nextOffset from the previous call to read the next chunk.'
+          },
+          frameId: {
+            type: 'integer',
+            description: 'Read a specific frame instead of the current focus frame. Omit to use the focus frame.'
           }
         }
       }
@@ -171,7 +214,7 @@ export const BROWSER_TOOLS = [
     function: {
       name: 'browser_iframes',
       description:
-        'List the iframes present on the FOCUS tab with their index, id, name, src, size, AND frameId. Modern content runs inside iframes (Canvas LMS lab UI, embedded editors, OAuth flows). The frameId is what you pass to browser_focus_frame to switch your actions into that iframe. After switching, browser_snapshot, browser_click_text, browser_click, browser_type, browser_extract, and browser_page_text all operate inside the chosen frame.',
+        'List EVERY live frame in the FOCUS tab (the real Chrome frame tree, not just <iframe> tags). Each entry has frameId, parentFrameId, depth, url, title, reachable, interactiveCount and textPreview. Frame ids are arbitrary numbers assigned by Chrome — they are NOT 0,1,2, and you must never guess one. Call this BEFORE browser_focus_frame, every time. Modern content lives inside frames (LMS lab consoles, embedded terminals, editors, OAuth). Pick a frame with reachable:true and a high interactiveCount or a meaningful textPreview; the response also names a suggestedFrameId. reachable:false means the extension cannot script that frame — open its url with browser_new_tab instead.',
       parameters: { type: 'object', properties: {}, additionalProperties: false }
     }
   },
@@ -180,13 +223,13 @@ export const BROWSER_TOOLS = [
     function: {
       name: 'browser_focus_frame',
       description:
-        'Switch the focus to a different frame inside the FOCUS tab. Pass frameId returned by browser_iframes. Pass 0 to return to the top document. After calling this, every subsequent browser_* action targets that frame until you switch back or change tabs.',
+        'Switch focus to a different frame inside the FOCUS tab. You MUST pass a frameId taken verbatim from a browser_iframes call — guessed values are rejected, and the focus is left unchanged. Pass 0 to return to the top document. The switch is verified: it only succeeds if the frame exists AND can be scripted, and the result echoes that frame url, title and interactiveCount so you can confirm you moved. After a successful switch, every browser_* action targets that frame until you switch again or change tabs.',
       parameters: {
         type: 'object',
         properties: {
           frameId: {
             type: 'integer',
-            description: 'Frame id (0 = top document). Use the value from browser_iframes for inner iframes.'
+            description: 'A frameId copied exactly from browser_iframes, or 0 for the top document. Never invent this number.'
           }
         },
         required: ['frameId']
@@ -198,7 +241,7 @@ export const BROWSER_TOOLS = [
     function: {
       name: 'browser_click_text',
       description:
-        'Click the most likely visible element on the FOCUS tab whose text contains the given substring. Use this when you know the label of a button/link but its [N] ref from browser_snapshot is hard to locate (long lists, dynamic DOM, repeated text). Returns the top 3 candidates so you can verify the right one was clicked. Prefer this over browser_click(ref) when text is descriptive and unique.',
+        'Click the most likely VISIBLE element in the FOCUS FRAME whose text contains the given substring. Use this when you know the label of a button/link but its [N] ref is hard to locate (long lists, dynamic DOM, repeated text). Returns the top 3 candidates so you can verify the right one was clicked. If the text exists but is hidden, the failure lists those hiddenMatches with their href — a hidden match usually means the real control is inside a frame, so call browser_iframes next. Prefer this over browser_click(ref) when the text is descriptive and unique.',
       parameters: {
         type: 'object',
         properties: {
@@ -219,10 +262,10 @@ export const BROWSER_TOOLS = [
     type: 'function',
     function: {
       name: 'browser_wait',
-      description: 'Wait for the given number of milliseconds (for slow pages or animations).',
+      description: 'Wait for the given number of milliseconds (for slow pages or animations). Requests above the cap are clamped and the result says so. Waiting does not change the page by itself — if two snapshots in a row look identical, waiting again will not help; change approach instead.',
       parameters: {
         type: 'object',
-        properties: { ms: { type: 'integer', description: 'Milliseconds (max 5000).' } },
+        properties: { ms: { type: 'integer', description: 'Milliseconds (capped at 30000).' } },
         required: ['ms']
       }
     }

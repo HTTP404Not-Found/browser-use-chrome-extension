@@ -45,6 +45,18 @@
           <input type="number" id="max-ctx" min="4000" max="200000" step="1000" />
           <small>How many characters of the current page to send to the model. Larger is more accurate, smaller is cheaper.</small>
         </label>
+
+        <label>
+          <span class="label">Max agent steps</span>
+          <input type="number" id="max-steps" min="5" max="200" step="5" />
+          <small>How many tool calls a single agent run may make before it gives up. Default 40. Raise it for long multi-page or multi-frame tasks.</small>
+        </label>
+
+        <label class="inline">
+          <input type="checkbox" id="show-badge" />
+          <span class="label">Show the "BU" badge on pages</span>
+          <small>Off by default. Only ever drawn on the top document, never inside iframes.</small>
+        </label>
       </section>
 
       <section class="card">

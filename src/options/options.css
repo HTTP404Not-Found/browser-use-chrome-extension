@@ -93,3 +93,17 @@ button.secondary { background: transparent; }
 .hint ul { margin: 0; padding-left: 18px; }
 .hint li { margin: 6px 0; color: #c0c4d0; font-size: 13px; line-height: 1.5; }
 .hint h3 { margin: 0 0 10px; font-size: 14px; }
+
+label.inline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+label.inline input[type='checkbox'] {
+  width: auto;
+  margin: 0;
+}
+label.inline small {
+  flex-basis: 100%;
+}
