@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Browser Use</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <div class="logo">✦</div>
+        <div class="title">
+          <div class="t1">Browser Use</div>
+          <div class="t2" id="page-context">No page</div>
+        </div>
+      </div>
+      <div class="actions">
+        <button id="btn-settings" class="icon-btn" title="Settings">⚙</button>
+        <button id="btn-clear" class="icon-btn" title="New chat">＋</button>
+      </div>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab active" data-tab="chat">Chat</button>
+      <button class="tab" data-tab="agent">Agent</button>
+    </nav>
+
+    <main id="main">
+      <!-- Chat view -->
+      <section id="view-chat" class="view active">
+        <div id="messages" class="messages"></div>
+        <div class="quick-row" id="quick-row">
+          <button class="chip" data-q="Summarize this page in 5 bullet points">Summarize</button>
+          <button class="chip" data-q="Extract the key facts and numbers mentioned">Key facts</button>
+          <button class="chip" data-q="Translate the page to Simplified Chinese">Translate ZH</button>
+          <button class="chip" data-q="Explain this page like I'm five years old">ELI5</button>
+        </div>
+      </section>
+
+      <!-- Agent view -->
+      <section id="view-agent" class="view">
+        <div class="agent-status" id="agent-status">
+          <span class="dot idle"></span>
+          <span class="label">Idle</span>
+          <div class="focus-badge" id="focus-badge" hidden>
+            <span class="focus-icon">◎</span>
+            <span class="focus-title"></span>
+          </div>
+          <button id="btn-abort" class="abort-btn" hidden>Stop</button>
+        </div>
+        <div id="focus-breadcrumb" class="focus-breadcrumb" hidden></div>
+        <div id="agent-log" class="agent-log"></div>
+        <div class="agent-hint">
+          Describe what you want the agent to do. The agent will drive the browser, observe each page, and keep going until the task is done.
+        </div>
+      </section>
+    </main>
+
+    <footer class="composer">
+      <div id="ask-user-row" class="ask-user-row" hidden>
+        <div class="ask-q" id="ask-q"></div>
+        <div class="ask-actions">
+          <input id="ask-input" type="text" placeholder="Your answer…" />
+          <button id="ask-send">Send</button>
+        </div>
+      </div>
+      <div class="composer-row">
+        <textarea id="input" rows="2" placeholder="Ask about this page…"></textarea>
+        <button id="send" class="send-btn" title="Send">↑</button>
+      </div>
+      <div class="hint-bar">
+        <label class="toggle">
+          <input type="checkbox" id="include-page" checked />
+          <span>Include page</span>
+        </label>
+        <span class="kbd-hint">Enter to send · Shift+Enter for newline</span>
+      </div>
+    </footer>
+
+    <script src="sidepanel.js" type="module"></script>
+  </body>
+</html>

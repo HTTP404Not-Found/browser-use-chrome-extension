@@ -1,0 +1,18 @@
+# Dev helpers (regenerable)
+gen_icons.py
+jscheck.py
+syntax_check.py
+__pycache__/
+*.pyc
+*.pyo
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Build outputs (none yet, but future-proof)
+dist/
+build/
+node_modules/
