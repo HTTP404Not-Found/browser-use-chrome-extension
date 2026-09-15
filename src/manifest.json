@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Browser Use",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "AI agent that lives in your Chrome sidebar — chat about any page, summarize, and let the agent drive the browser for you. Inspired by Perplexity Comet.",
   "minimum_chrome_version": "116",
   "permissions": [

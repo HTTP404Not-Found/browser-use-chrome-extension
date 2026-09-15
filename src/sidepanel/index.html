@@ -65,7 +65,13 @@
           <button id="ask-send">Send</button>
         </div>
       </div>
+      <div id="attachments" class="attachments" hidden></div>
       <div class="composer-row">
+        <div class="composer-tools">
+          <button id="btn-attach" class="icon-btn small" title="Attach images (vision model). You can also paste or drop them.">📎</button>
+          <button id="btn-shot" class="icon-btn small" title="Attach a screenshot of this page">📷</button>
+          <input id="file-input" type="file" accept="image/*" multiple hidden />
+        </div>
         <textarea id="input" rows="2" placeholder="Ask about this page…"></textarea>
         <button id="send" class="send-btn" title="Send">↑</button>
       </div>

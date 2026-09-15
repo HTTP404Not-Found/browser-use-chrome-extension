@@ -9,8 +9,8 @@ terminals and code editors.
 Works with any OpenAI-compatible API endpoint (OpenAI, DeepSeek,
 OpenRouter, vLLM, Ollama, …).
 
-**Current version:** v3.0. See [CHANGELOG.md](./CHANGELOG.md) for
-what changed since v1/v2.
+**Current version:** v4.0 (manifest `0.4.0`). See [CHANGELOG.md](./CHANGELOG.md)
+for what changed since v1/v2/v3.
 
 ## Features
 
@@ -34,8 +34,12 @@ what changed since v1/v2.
 - **Multi-tab** (`browser_tabs`, `browser_new_tab`, `browser_switch_tab`)
   and **asking the user clarifying questions** mid-task
   (`browser_ask_user`).
-- **Configurable** — any OpenAI-compatible endpoint, plus a
-  configurable agent step budget.
+- **Multimodal** — with a vision model, attach, paste or drop images (or a
+  screenshot of the page) in the side panel, and the agent can take
+  screenshots with `browser_screenshot` and click what it sees with
+  `browser_click_at`.
+- **Configurable** — any OpenAI-compatible endpoint, a context window of up
+  to 1M tokens, and a configurable agent step budget.
 
 ## Install (unpacked, dev mode)
 
@@ -156,10 +160,12 @@ exposure.
   visible to the snapshot helper.
 - Login walls and 2FA need `browser_ask_user` (the agent will prompt
   you when needed).
-- No vision in v2 — the agent reads the DOM, not pixels. Canvas-rendered
-  xterm.js terminals genuinely cannot be read from the DOM, and
-  `browser_read_terminal` will say so instead of letting the agent
-  burn steps guessing selectors.
+- Without a vision model the agent reads the DOM, not pixels. Canvas-rendered
+  xterm.js terminals cannot be read from the DOM, and `browser_read_terminal`
+  says so instead of letting the agent burn steps guessing selectors. With a
+  vision model it can read them through `browser_screenshot`.
+- Screenshots of a tab that is not showing in its window go through the
+  DevTools protocol and can fail while Chrome is not painting that tab.
 
 ## License
 

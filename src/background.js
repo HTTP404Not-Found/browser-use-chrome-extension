@@ -16,9 +16,17 @@
 // is looking at, and agent runs keep an event log the panel replays when the
 // user switches back to that tab.
 
-import { streamChat, getLlmConfig } from './lib/llm.js';
-import { BROWSER_TOOLS, TOOL_NAME_SET } from './lib/tools.js';
-import { CHAT_SYSTEM_PROMPT, AGENT_SYSTEM_PROMPT, buildPageContextMessage } from './lib/prompts.js';
+import {
+  streamChat,
+  getLlmConfig,
+  estimateTokens,
+  historyBudgetTokens,
+  toolResultMaxChars,
+  pageTextMaxChars
+} from './lib/llm.js';
+import { TOOL_NAME_SET, toolsFor } from './lib/tools.js';
+import { CHAT_SYSTEM_PROMPT, AGENT_SYSTEM_PROMPT, AGENT_VISION_PROMPT, buildPageContextMessage } from './lib/prompts.js';
+import { dataUrlToBlob, encodeScaled } from './lib/images.js';
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -29,13 +37,15 @@ import { CHAT_SYSTEM_PROMPT, AGENT_SYSTEM_PROMPT, buildPageContextMessage } from
 // asks the user a question, or when it is aborted.
 const DEFAULT_MAX_AGENT_STEPS = Infinity;
 const MAX_WAIT_MS = 30000;
-// A single tool result stored in the conversation.
-const TOOL_RESULT_MAX_CHARS = 12000;
-// Older tool results are collapsed to a one-line summary before each LLM call.
-// Without this every step re-sent every snapshot and page dump since the start
-// of the run, so late steps carried 100k+ tokens of stale observations.
+// Before each LLM call the history is fitted to the configured context window
+// (Settings → Context window, up to 1M tokens). Walking back from the newest
+// message, tool results stay verbatim while they fit; older ones collapse to a
+// one-line summary. The last few are always verbatim whatever the budget.
 const KEEP_FULL_TOOL_RESULTS = 6;
 const KEEP_REASONING_TURNS = 3;
+// Screenshots cost ~1k tokens each and go stale quickly.
+const MAX_IMAGES_IN_CONTEXT = 3;
+const SCREENSHOT_MAX_SIDE = 1280;
 // Events kept per agent run so the panel can replay a tab's run.
 const RUN_LOG_MAX = 400;
 // Default time send_keys waits for a shell prompt to come back after Enter.
@@ -158,6 +168,15 @@ function appendRunLog(run, evt) {
   } else {
     log.push(evt);
   }
+  if (evt.type === 'agent:image') {
+    // Keep thumbnails for the latest screenshots only.
+    let seen = 0;
+    for (let i = log.length - 1; i >= 0; i--) {
+      if (log[i].type !== 'agent:image') continue;
+      seen += 1;
+      if (seen > 10 && log[i].thumbnail) log[i] = { ...log[i], thumbnail: null };
+    }
+  }
   if (log.length > RUN_LOG_MAX) log.splice(0, log.length - RUN_LOG_MAX);
 }
 
@@ -257,7 +276,10 @@ function persistChatStore() {
   persistTimer = setTimeout(() => {
     persistTimer = null;
     try {
-      const obj = Object.fromEntries(chatByTabId);
+      // Images stay in memory only: chrome.storage.session has a 10MB quota.
+      const obj = Object.fromEntries(
+        Array.from(chatByTabId, ([k, v]) => [k, { ...v, messages: v.messages.map(persistableMessage) }])
+      );
       chrome.storage.session?.set?.({ chatByTabId: obj });
     } catch {}
   }, 250);
@@ -285,7 +307,8 @@ chrome.tabs?.onActivated?.addListener?.((activeInfo) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   attachedTabs.delete(tabId);
-  for (const [key, cm] of inputModeCache) if (key.startsWith(`${tabId}:`)) inputModeCache.delete(key);
+  for (const key of inputModeCache.keys()) if (key.startsWith(`${tabId}:`)) inputModeCache.delete(key);
+  for (const key of charMethodCache.keys()) if (key.startsWith(`${tabId}:`)) charMethodCache.delete(key);
   if (chatByTabId.has(tabId)) {
     chatByTabId.delete(tabId);
     persistChatStore();
@@ -320,10 +343,12 @@ async function handleClientMessage(msg, port) {
         return;
       }
       await chatStoreReady;
+      const cfg = await getLlmConfig();
+      const userContent = buildUserContent(userText, msg.images, cfg.supportsVision);
       const chat = getOrCreateChat(tabId);
       // Persist the user message immediately so a quick refresh / SW restart
       // doesn't drop it.
-      chat.messages.push({ role: 'user', content: userText });
+      chat.messages.push({ role: 'user', content: userContent });
       chat.updatedAt = Date.now();
       persistChatStore();
       broadcastChat(tabId);
@@ -333,7 +358,7 @@ async function handleClientMessage(msg, port) {
       // Carry forward the prior conversation (excluding the brand-new user msg
       // we just appended, since we add it again below to keep ordering exact).
       for (let i = 0; i < chat.messages.length - 1; i++) messages.push(chat.messages[i]);
-      messages.push({ role: 'user', content: userText });
+      messages.push({ role: 'user', content: userContent });
       return startChat(messages, tabId, chat);
     }
     case 'chat:regenerate': {
@@ -390,12 +415,11 @@ async function handleClientMessage(msg, port) {
           return `  - tab ${t.id}${flags ? ` (${flags})` : ''}: ${truncate(t.title || t.url || '', 80)}`;
         })
         .join('\n');
-      const messages = [
-        { role: 'system', content: AGENT_SYSTEM_PROMPT },
-        {
-          role: 'user',
-          content:
+      const cfg = await getLlmConfig();
+      const images = Array.isArray(msg.images) ? msg.images : [];
+      const taskText =
             `Task: ${task}\n\n` +
+            (images.length ? `The user attached ${images.length} image(s) to this task; treat them as part of the instructions.\n\n` : '') +
             (page
               ? `Starting page: ${page.url} — ${page.title}\n\n` +
                 `Begin with browser_snapshot to see the page state.`
@@ -404,10 +428,12 @@ async function handleClientMessage(msg, port) {
             `Your focus tab starts at tab ${ownerTabId}. ` +
             `Use browser_tabs any time you need to check the tab landscape. ` +
             `Use browser_switch_tab to change focus, browser_new_tab to open more, ` +
-            `and browser_extract_from_tab or browser_page_text to read a tab without disturbing the user.`
-        }
+            `and browser_extract_from_tab or browser_page_text to read a tab without disturbing the user.`;
+      const messages = [
+        { role: 'system', content: AGENT_SYSTEM_PROMPT + (cfg.supportsVision ? AGENT_VISION_PROMPT : '') },
+        { role: 'user', content: buildUserContent(taskText, images, cfg.supportsVision) }
       ];
-      return startAgent(messages, ownerTabId, ownerTab?.title || ownerTab?.url || '');
+      return startAgent(messages, ownerTabId, ownerTab?.title || ownerTab?.url || '', task, images.length);
     }
     case 'agent:userReply': {
       const run = agentRuns.get(msg.ownerTabId);
@@ -481,8 +507,10 @@ async function startChat(messages, tabId, chat) {
 
 async function runChatOnce(run) {
   try {
+    const cfg = await getLlmConfig();
+    const budget = historyBudgetTokens(cfg);
     const final = await streamChat({
-      messages: run.messages,
+      messages: buildLlmMessages(fitChatToBudget(run.messages, budget), budget),
       signal: run.abort.signal,
       onDelta: (content) => emit(run, { type: 'token', content }),
       onReasoningDelta: (content) => emit(run, { type: 'reasoning', content }),
@@ -514,20 +542,16 @@ async function runChatOnce(run) {
 // Agent run (loop with tool execution)
 // ---------------------------------------------------------------------------
 
-async function getMaxAgentSteps() {
-  try {
-    const cfg = await getLlmConfig();
-    const n = Number(cfg?.maxSteps);
-    // 0 / negative / non-finite / missing -> unlimited. Anything >= 1 is taken
-    // verbatim with no upper cap (options.js is the UI's clamp; the runtime
-    // trusts the user-chosen value).
-    if (!Number.isFinite(n) || n <= 0) return Infinity;
-    return Math.floor(n);
-  } catch {}
-  return DEFAULT_MAX_AGENT_STEPS;
+function maxAgentSteps(cfg) {
+  const n = Number(cfg?.maxSteps);
+  // 0 / negative / non-finite / missing -> unlimited. Anything >= 1 is taken
+  // verbatim with no upper cap (options.js is the UI's clamp; the runtime
+  // trusts the user-chosen value).
+  if (!Number.isFinite(n) || n <= 0) return Infinity;
+  return Math.floor(n);
 }
 
-async function startAgent(messages, ownerTabId, ownerTitle) {
+async function startAgent(messages, ownerTabId, ownerTitle, task = '', imageCount = 0) {
   const run = {
     kind: 'agent',
     ownerTabId,
@@ -551,9 +575,7 @@ async function startAgent(messages, ownerTabId, ownerTitle) {
   };
   agentRuns.set(ownerTabId, run);
   emit(run, { type: 'run:start', kind: 'agent' });
-  const firstUser = messages.find((m) => m.role === 'user');
-  const task = /^Task: ([\s\S]*?)\n\n/.exec(firstUser?.content || '')?.[1] || '';
-  emit(run, { type: 'agent:task', task });
+  emit(run, { type: 'agent:task', task, imageCount });
   broadcastRuns();
   await recordFocus(run, ownerTabId, 0);
   return resumeAgent(run);
@@ -574,7 +596,11 @@ async function resumeAgent(run) {
     while (!run.finished && !run.abort.signal.aborted) {
       if (run.awaitingUser) return; // paused
       run.step += 1;
-      const maxSteps = await getMaxAgentSteps();
+      // Re-read settings every step so a changed context window or vision
+      // switch applies to a run that is already going.
+      const cfg = await getLlmConfig();
+      run.cfg = cfg;
+      const maxSteps = maxAgentSteps(cfg);
       if (maxSteps !== Infinity && run.step > maxSteps) {
         emit(run, {
           type: 'error',
@@ -587,8 +613,8 @@ async function resumeAgent(run) {
       }
       emit(run, { type: 'agent:step', step: run.step });
       const final = await streamChat({
-        messages: buildLlmMessages(run.messages),
-        tools: BROWSER_TOOLS,
+        messages: buildLlmMessages(run.messages, historyBudgetTokens(cfg)),
+        tools: toolsFor(cfg),
         toolChoice: 'auto',
         signal: run.abort.signal,
         onDelta: (content) => emit(run, { type: 'token', content }),
@@ -607,6 +633,9 @@ async function resumeAgent(run) {
 
       // Execute tool calls sequentially.
       const toolResults = [];
+      // Images produced by tools (screenshots). A tool message can only carry
+      // text, so they follow the tool results as one user message.
+      const attachments = [];
       for (let i = 0; i < toolCalls.length; i++) {
         const tc = toolCalls[i];
         if (run.abort.signal.aborted) break;
@@ -626,9 +655,13 @@ async function resumeAgent(run) {
           observation = { ok: false, error: String(e?.message || e) };
         }
         if (!observation || typeof observation !== 'object') observation = { ok: false, error: 'No result' };
+        if (observation._attach) {
+          attachments.push(observation._attach);
+          delete observation._attach;
+        }
         applyLoopGuard(run, name, args, observation);
         emit(run, { type: 'agent:toolResult', name, observation });
-        toolResults.push({ role: 'tool', tool_call_id: tc.id, name, content: clipToolContent(observation) });
+        toolResults.push({ role: 'tool', tool_call_id: tc.id, name, content: clipToolContent(observation, toolResultMaxChars(cfg)) });
 
         // Special tools that pause/end the loop. Any calls the model batched
         // after them still need a tool message, or the next request is invalid.
@@ -654,6 +687,15 @@ async function resumeAgent(run) {
         }
       }
       run.messages.push(...toolResults);
+      if (attachments.length) {
+        run.messages.push({
+          role: 'user',
+          content: attachments.flatMap((a) => [
+            { type: 'text', text: a.text },
+            { type: 'image_url', image_url: { url: a.dataUrl } }
+          ])
+        });
+      }
     }
     if (!run.finished && run.abort.signal.aborted) await finishAgentRun(run, { error: true, aborted: true });
   } catch (e) {
@@ -664,42 +706,105 @@ async function resumeAgent(run) {
   }
 }
 
-function clipToolContent(observation) {
+function clipToolContent(observation, maxChars) {
   let s;
   try { s = JSON.stringify(observation); } catch { s = String(observation); }
-  return s.length > TOOL_RESULT_MAX_CHARS ? s.slice(0, TOOL_RESULT_MAX_CHARS) + '…[truncated]' : s;
+  return s.length > maxChars ? s.slice(0, maxChars) + '…[truncated]' : s;
 }
 
 // Build the message list for one LLM call without mutating the run history.
-// Recent observations stay verbatim; older ones become short summaries so the
-// request size stays roughly flat instead of growing with every step. The
-// summary for a given message never changes once made, so provider prefix
-// caching still covers everything except the last few steps.
-function buildLlmMessages(messages) {
+// Walking back from the newest message with a running token count, content
+// stays verbatim while it fits `budgetTokens`; past that, tool results become
+// one-line summaries and long tool-call arguments are elided. The count at a
+// given message only grows as the run continues, so once a message is
+// summarized it stays summarized and provider prefix caching keeps working.
+// Only the last MAX_IMAGES_IN_CONTEXT images are sent, whatever the budget.
+function buildLlmMessages(messages, budgetTokens = Infinity) {
   const out = new Array(messages.length);
+  let used = 0;
   let toolsSeen = 0;
   let assistantsSeen = 0;
+  let imagesSeen = 0;
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
-    if (m.role === 'tool') {
+    let next = m;
+    if (i < 2) {
+      // System prompt and the task / page context are always sent as-is.
+    } else if (m.role === 'tool') {
       toolsSeen += 1;
-      out[i] = toolsSeen > KEEP_FULL_TOOL_RESULTS ? { ...m, content: summarizeOldToolContent(m.content) } : m;
+      if (toolsSeen > KEEP_FULL_TOOL_RESULTS && used + estimateTokens(m.content) > budgetTokens) {
+        next = { ...m, content: summarizeOldToolContent(m.content) };
+      }
     } else if (m.role === 'assistant') {
       assistantsSeen += 1;
-      let next = m;
       if (assistantsSeen > KEEP_REASONING_TURNS && next.reasoning_content) {
         next = { ...next };
         delete next.reasoning_content;
       }
-      if (assistantsSeen > KEEP_FULL_TOOL_RESULTS && Array.isArray(next.tool_calls)) {
+      if (assistantsSeen > KEEP_FULL_TOOL_RESULTS && Array.isArray(next.tool_calls) && used + estimateTokens(next) > budgetTokens) {
         next = { ...next, tool_calls: next.tool_calls.map(shrinkToolCall) };
       }
-      out[i] = next;
-    } else {
-      out[i] = m;
+    } else if (Array.isArray(m.content)) {
+      next = {
+        ...m,
+        content: m.content.map((part) => {
+          if (part?.type !== 'image_url') return part;
+          imagesSeen += 1;
+          return imagesSeen > MAX_IMAGES_IN_CONTEXT ? { type: 'text', text: '[older image removed to save context]' } : part;
+        })
+      };
+    }
+    used += estimateTokens(next);
+    out[i] = next;
+  }
+  return out;
+}
+
+// Chat history is plain turns, so it is fitted by dropping the oldest turns
+// (never the system prompt, the page context or the new question), then by
+// shortening the page context if that alone is too big.
+function fitChatToBudget(messages, budgetTokens) {
+  const out = messages.slice();
+  let total = out.reduce((n, m) => n + estimateTokens(m), 0);
+  const hasCtx = typeof out[1]?.content === 'string' && out[1].content.startsWith('[page-context]');
+  const first = hasCtx ? 2 : 1;
+  while (total > budgetTokens && out.length - 1 > first) {
+    total -= estimateTokens(out[first]);
+    out.splice(first, 1);
+    // Never start the remaining history with an orphaned assistant reply.
+    while (out.length - 1 > first && out[first].role === 'assistant') {
+      total -= estimateTokens(out[first]);
+      out.splice(first, 1);
+    }
+  }
+  if (total > budgetTokens && hasCtx) {
+    const ctx = out[1];
+    const others = total - estimateTokens(ctx);
+    const keepChars = Math.max(2000, Math.floor((budgetTokens - others) * 3));
+    if (ctx.content.length > keepChars) {
+      out[1] = { ...ctx, content: ctx.content.slice(0, keepChars) + '\n[... page content truncated to fit the context window ...]\n[/page-context]' };
     }
   }
   return out;
+}
+
+// User text plus attached images as OpenAI-style content parts. Without a
+// vision model the images are dropped and the model is told so.
+function buildUserContent(text, images, supportsVision) {
+  const list = Array.isArray(images) ? images.filter((u) => typeof u === 'string' && u.startsWith('data:image/')) : [];
+  if (!list.length) return text;
+  if (!supportsVision) {
+    return `${text}\n\n(The user attached ${list.length} image(s), but the configured model is not marked as vision-capable, so they were not sent.)`;
+  }
+  return [{ type: 'text', text }, ...list.map((url) => ({ type: 'image_url', image_url: { url } }))];
+}
+
+// What gets written to chrome.storage.session: text plus an image count.
+function persistableMessage(m) {
+  if (!Array.isArray(m?.content)) return m;
+  const text = m.content.filter((p) => p?.type === 'text').map((p) => p.text).join('\n');
+  const imageCount = m.content.filter((p) => p?.type === 'image_url').length;
+  return { ...m, content: text, ...(imageCount ? { imageCount } : {}) };
 }
 
 function summarizeOldToolContent(content) {
@@ -746,7 +851,11 @@ function applyLoopGuard(run, name, args, observation) {
     finished: observation.finished,
     readable: observation.readable,
     renderer: observation.renderer,
-    note: observation.note
+    note: observation.note,
+    // Reads whose content changed are not repeats. Without these, three
+    // browser_read_terminal calls showing different output tripped the guard.
+    textTail: typeof observation.text === 'string' ? observation.text.slice(-120) : undefined,
+    outputTail: typeof observation.output === 'string' ? observation.output.slice(-120) : undefined
   };
   const sig = name + '|' + JSON.stringify(args) + '|' + JSON.stringify(stableObs);
   run.recentCalls = (run.recentCalls || []).concat([sig]).slice(-8);
@@ -806,6 +915,10 @@ async function executeTool(run, name, args) {
       return doFocusFrame(run, args.frameId);
     case 'browser_click_text':
       return doClickText(run, args.text, args.exact);
+    case 'browser_screenshot':
+      return doScreenshot(run);
+    case 'browser_click_at':
+      return doClickAt(run, args.x, args.y, !!args.double);
     case 'browser_wait': {
       // Was silently clamped to 5000, so a request for 10000 reported
       // "waited: 5000" with no explanation and the agent kept re-waiting.
@@ -1052,6 +1165,165 @@ async function realKey(tabId, spec) {
 }
 
 // ---------------------------------------------------------------------------
+// Typing text one character at a time
+// ---------------------------------------------------------------------------
+// The Vocareum lab terminal (term.js) consistently swallows the key events for
+// some letters — "sudo" arrived as "uo", "install" as "intll", "pwd" as "pw" —
+// even one key per step, so no delay or retry fixes it. Each character can be
+// delivered in several ways; when one does not land we try the next and
+// remember, per target, which way works.
+//   keys      rawKeyDown (no text) + char (text) + keyUp. The shape Playwright
+//             and browser-use use; no nativeVirtualKeyCode.
+//   char      only the char event. With no keydown there is nothing for a page
+//             keydown handler to cancel, which also cancels the keypress.
+//   insert    Input.insertText.
+//   synthetic untrusted keydown/keypress/keyup from the content script, which
+//             old terminal libraries do not distinguish from real input.
+
+const CHAR_METHODS = ['keys', 'char', 'insert', 'synthetic'];
+const CHAR_LAND_TIMEOUT_MS = 600;
+const UNREACHABLE_CHAR_HINT =
+  "In bash you can avoid typing that character: write it as $'\\xNN' (for example s is $'\\x73', so ls becomes l$'\\x73'). " +
+  'Otherwise use another terminal the task allows, or call browser_ask_user.';
+
+/** @type {Map<string, Map<string, string>>} `${tabId}:${frameId}` -> char -> method */
+const charMethodCache = new Map();
+
+function charMethodsFor(cacheKey) {
+  let m = charMethodCache.get(cacheKey);
+  if (!m) {
+    m = new Map();
+    charMethodCache.set(cacheKey, m);
+  }
+  return m;
+}
+
+async function dispatchTypedChar(tabId, spec) {
+  const modifiers = spec.shift ? MOD.shift : 0;
+  const keyFields = { key: spec.key, code: spec.code || '', windowsVirtualKeyCode: spec.vk || 0, modifiers };
+  await cdp(tabId, 'Input.dispatchKeyEvent', { ...keyFields, type: 'rawKeyDown' });
+  await cdp(tabId, 'Input.dispatchKeyEvent', { type: 'char', text: spec.text, unmodifiedText: spec.text, key: spec.key, modifiers });
+  await cdp(tabId, 'Input.dispatchKeyEvent', { ...keyFields, type: 'keyUp' });
+}
+
+async function sendChar(run, tabId, ch, method) {
+  if (ch === '\n' || ch === '\r') return dispatchSpec(tabId, { ...NAMED_KEYS.Enter, key: 'Enter', modifiers: 0 });
+  if (ch === '\t') return dispatchSpec(tabId, { ...NAMED_KEYS.Tab, key: 'Tab', modifiers: 0 });
+  const spec = charSpec(ch);
+  if (method === 'insert' || (spec.textOnly && method === 'keys')) return cdp(tabId, 'Input.insertText', { text: ch });
+  if (method === 'char') return cdp(tabId, 'Input.dispatchKeyEvent', { type: 'char', text: ch, unmodifiedText: ch, key: ch });
+  if (method === 'synthetic') {
+    try { await sendToContent(run, tabId, { type: 'pressKey', key: ch }); } catch {}
+    return;
+  }
+  return dispatchTypedChar(tabId, spec);
+}
+
+async function typeFast(run, tabId, body, delayMs, methods) {
+  for (const ch of body) {
+    await sendChar(run, tabId, ch, methods.get(ch) || 'keys');
+    if (delayMs > 0) await sleep(delayMs);
+  }
+}
+
+function echoIo(run, tabId) {
+  return {
+    send: (ch, method) => sendChar(run, tabId, ch, method),
+    backspace: () => realKey(tabId, { ...NAMED_KEYS.Backspace, key: 'Backspace', modifiers: 0 }),
+    read: () => readEcho(run, tabId)
+  };
+}
+
+async function pollSample(io, test, timeoutMs, stepMs = 40) {
+  const start = Date.now();
+  for (;;) {
+    const r = await io.read();
+    if (!r || r.readable === false) return { state: 'unreadable', sample: '' };
+    if (test(r.sample)) return { state: 'landed', sample: r.sample };
+    if (Date.now() - start >= timeoutMs) return { state: 'missing', sample: r.sample };
+    await sleep(stepMs);
+  }
+}
+
+async function readAnchor(io) {
+  const r = await io.read();
+  if (!r || r.readable === false) return null;
+  return squash(r.sample).slice(-40);
+}
+
+// Type `body` confirming every visible character. Checks are anchored to the
+// screen text before the current line started (the prompt), so a character
+// that arrives twice is caught instead of matching a one-letter suffix.
+async function typeCharsVerified(body, methods, io) {
+  const repaired = new Set();
+  const unreadable = () => ({ ok: false, unreadable: true, repaired: [...repaired] });
+  let lineNo = 1;
+  let line = '';
+  let anchor = await readAnchor(io);
+  if (anchor == null) return unreadable();
+
+  for (const ch of body) {
+    if (ch === '\n' || ch === '\r') {
+      const before = await io.read();
+      await io.send('\n', 'keys');
+      await pollSample(io, (s) => s !== before?.sample, 1000);
+      await sleep(150); // let the continuation prompt render
+      anchor = await readAnchor(io);
+      if (anchor == null) return unreadable();
+      line = '';
+      lineNo += 1;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      // Whitespace is invisible to the squashed comparison; it is confirmed
+      // implicitly by the next visible character landing in the right place.
+      await io.send(ch, methods.get(ch) || 'keys');
+      line += ch;
+      continue;
+    }
+
+    const expectedNow = (anchor + squash(line)).slice(-80);
+    const cur = await io.read();
+    if (!cur || cur.readable === false) return unreadable();
+    const curSq = squash(cur.sample);
+    // A late copy of the previous character sits past the cursor: remove it.
+    if (!curSq.endsWith(expectedNow) && curSq.slice(0, -1).endsWith(expectedNow)) {
+      await io.backspace();
+      await pollSample(io, (s) => squash(s).endsWith(expectedNow), CHAR_LAND_TIMEOUT_MS);
+    }
+
+    const want = (anchor + squash(line + ch)).slice(-80);
+    const landed = (s) => squash(s).endsWith(want);
+    const cached = methods.get(ch);
+    const order = cached ? [cached, ...CHAR_METHODS.filter((m) => m !== cached)] : CHAR_METHODS;
+    let ok = false;
+    for (const method of order) {
+      await io.send(ch, method);
+      let r = await pollSample(io, landed, CHAR_LAND_TIMEOUT_MS);
+      if (r.state === 'unreadable') return unreadable();
+      // The previous method's copy arrived late as well: one too many.
+      if (r.state === 'missing' && squash(r.sample).endsWith(want + squash(ch))) {
+        await io.backspace();
+        r = await pollSample(io, landed, CHAR_LAND_TIMEOUT_MS);
+      }
+      if (r.state === 'landed') {
+        ok = true;
+        if (method === 'keys') {
+          methods.delete(ch);
+        } else {
+          if (method !== cached) repaired.add(ch);
+          methods.set(ch, method);
+        }
+        break;
+      }
+    }
+    if (!ok) return { ok: false, failedChar: ch, line: lineNo, repaired: [...repaired] };
+    line += ch;
+  }
+  return { ok: true, repaired: [...repaired] };
+}
+
+// ---------------------------------------------------------------------------
 // Echo verification and command output
 // ---------------------------------------------------------------------------
 
@@ -1118,21 +1390,18 @@ async function waitForEcho(run, tabId, expected, beforeSample, timeoutMs) {
   return { readable: true, landed: false, changed: last.sample !== beforeSample, sample: last.sample, source: last.source };
 }
 
-async function clearCurrentInput(tabId, source) {
+// Clear the current input line and wait until the screen is back to how it
+// looked before typing. Retrying against a stale screen is what made a mangled
+// "uo pip3 intll boto3" get reported as "nothing changed".
+async function clearAndConfirm(run, tabId, source, baselineSample) {
   if (source === 'field') {
     await realKey(tabId, { ...charSpec('a'), modifiers: MOD.ctrl, text: '' });
     await realKey(tabId, { ...NAMED_KEYS.Backspace, key: 'Backspace', modifiers: 0 });
   } else {
     await realKey(tabId, { ...charSpec('u'), modifiers: MOD.ctrl, text: '' });
   }
-  await sleep(150);
-}
-
-async function typeBody(tabId, body, delayMs) {
-  for (const ch of body) {
-    await realKey(tabId, charSpec(ch));
-    if (delayMs > 0) await sleep(delayMs);
-  }
+  const base = squash(baselineSample).slice(-40);
+  await pollSample(echoIo(run, tabId), (s) => squash(s).endsWith(base), 1000);
 }
 
 // Get `body` into the focused element and confirm it arrived. Never presses
@@ -1148,7 +1417,7 @@ async function typeAndVerify(run, tabId, body, delayOpt) {
   if (!readable) {
     // Nothing to verify against (canvas terminal). Key events are the most
     // reliable path there; type once, no retries.
-    await typeBody(tabId, body, delayMs);
+    await typeFast(run, tabId, body, delayMs, charMethodsFor(cacheKey));
     return { ok: true, verified: null, mode: 'keys', source: before?.source, note: UNVERIFIED_NOTE };
   }
 
@@ -1175,64 +1444,88 @@ async function typeAndVerify(run, tabId, body, delayOpt) {
             hint: 'Read the result with browser_read_terminal. On a shell, press Ctrl+C with browser_press_key to get a clean prompt before trying again.'
           };
         }
-        await clearCurrentInput(tabId, echo.source);
+        await clearAndConfirm(run, tabId, echo.source, before.sample);
       } else {
         inputModeCache.set(cacheKey, 'keys');
       }
     }
   }
 
-  // 2) Real key events.
+  // 2) Key events.
+  const methods = charMethodsFor(cacheKey);
+  const io = echoIo(run, tabId);
+
   if (multiline) {
-    // No retries: every newline has already run a line, so clearing and
-    // retyping would duplicate input — which is exactly how the last run ended
-    // up with four copies of a heredoc in the shell.
-    const pre = (await readEcho(run, tabId)) || before;
-    await typeBody(tabId, body, delayMs);
-    const echo = await waitForEcho(run, tabId, expected, pre.sample, 2000);
-    if (echo.readable === false) return { ok: true, verified: null, mode: 'keys', source: echo.source, note: UNVERIFIED_NOTE };
-    if (echo.landed) return { ok: true, verified: true, mode: 'keys', source: echo.source };
+    // Every newline runs a line, so a mangled heredoc cannot be cleared and
+    // retried like a single line. Confirm each character as it goes instead.
+    const r = await typeCharsVerified(body, methods, io);
+    if (r.unreadable) return { ok: true, verified: null, mode: 'keys', source: before.source, note: UNVERIFIED_NOTE };
+    if (r.ok) {
+      return { ok: true, verified: true, mode: 'keys-verified', source: before.source, ...(r.repaired.length ? { repairedChars: r.repaired } : {}) };
+    }
     return {
       ok: false,
       verified: false,
-      mode: 'keys',
-      error: 'Multi-line text was typed but its last line did not echo. Enter was NOT pressed; earlier lines may already have run.',
-      landed: String(echo.sample || '').slice(-300),
-      hint: 'Read the terminal with browser_read_terminal, then press Ctrl+C with browser_press_key to reset the prompt.'
+      mode: 'keys-verified',
+      error:
+        `Typing stopped on line ${r.line}: the character ${JSON.stringify(r.failedChar)} never reached the target by any input method. ` +
+        'Enter was NOT pressed; earlier lines may already have run.',
+      hint: 'Press Ctrl+C with browser_press_key to reset the prompt. ' + UNREACHABLE_CHAR_HINT
     };
   }
 
-  const attempts = [];
-  let lastEcho = null;
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    const pre = (await readEcho(run, tabId)) || before;
-    await typeBody(tabId, body, delayMs);
-    const echo = await waitForEcho(run, tabId, expected, pre.sample, 1500);
-    lastEcho = echo;
-    attempts.push({ attempt, delayMs, verified: !!echo.landed });
-    if (echo.readable === false) return { ok: true, verified: null, mode: 'keys', attempts: attempt, source: echo.source, note: UNVERIFIED_NOTE };
-    if (echo.landed) return { ok: true, verified: true, mode: 'keys', attempts: attempt, source: echo.source };
-    // Nothing reached the target at all: that is a focus problem, and retyping
-    // more slowly cannot fix it.
-    if (!echo.changed || INCLUDES_SOURCES.has(echo.source)) break;
-    await clearCurrentInput(tabId, echo.source);
-    delayMs = Math.min(200, Math.max(40, delayMs * 4));
+  const pre = (await readEcho(run, tabId)) || before;
+  await typeFast(run, tabId, body, delayMs, methods);
+  const echo = await waitForEcho(run, tabId, expected, pre.sample, 1500);
+  if (echo.readable === false) return { ok: true, verified: null, mode: 'keys', source: echo.source, note: UNVERIFIED_NOTE };
+  if (echo.landed) return { ok: true, verified: true, mode: 'keys', source: echo.source };
+  if (!echo.changed) {
+    return {
+      ok: false,
+      verified: false,
+      submitted: false,
+      mode: 'keys',
+      error: 'Nothing reached the target — neither pasting nor key events changed it. Enter was NOT pressed.',
+      hint: 'Call browser_focus_terminal (or click inside the terminal) and retry once. If it still fails, stop retrying variants: use another terminal the task allows, or call browser_ask_user.'
+    };
+  }
+  if (INCLUDES_SOURCES.has(echo.source)) {
+    return {
+      ok: false,
+      verified: false,
+      submitted: false,
+      mode: 'keys',
+      error: 'The text that landed does not match what was sent. It was not retried, because this editor can be edited mid-document.',
+      landed: String(echo.sample || '').slice(-200)
+    };
   }
 
+  // 3) Some characters were dropped. Clear the line and type it again one
+  // confirmed character at a time, switching delivery method for any character
+  // that does not land. What works is remembered, so the next send is fast.
+  const firstAttempt = String(echo.sample || '').slice(-120);
+  await clearAndConfirm(run, tabId, echo.source, pre.sample);
+  const r = await typeCharsVerified(body, methods, io);
+  if (r.ok) {
+    const final = await waitForEcho(run, tabId, expected, pre.sample, 1000);
+    if (final.landed) {
+      return { ok: true, verified: true, mode: 'keys-repaired', source: final.source, repairedChars: r.repaired, firstAttempt };
+    }
+  }
+  await clearAndConfirm(run, tabId, echo.source, pre.sample);
   return {
     ok: false,
     verified: false,
     submitted: false,
-    mode: 'keys',
-    attempts,
-    error: lastEcho?.changed
-      ? 'The characters that reached the target did not match what was sent. The line was cleared and Enter was NOT pressed.'
-      : 'Nothing changed in the target after pasting and typing — the keystrokes are not reaching it. Enter was NOT pressed.',
+    mode: 'keys-repaired',
+    error: r.failedChar
+      ? `The character ${JSON.stringify(r.failedChar)} never reached the target by any input method (key events, char event, insertText, synthetic event). The line was cleared and Enter was NOT pressed.`
+      : 'Characters kept being dropped even when typed one at a time. The line was cleared and Enter was NOT pressed.',
     sent: body.slice(0, 200),
-    landed: String(lastEcho?.sample || '').slice(-200),
-    hint: lastEcho?.changed
-      ? 'Retry once with a higher delayMs. If it still fails, read the terminal to see what is being mangled.'
-      : 'Call browser_focus_terminal (or click inside the terminal) and retry once. If it still fails, stop retrying variants: use another terminal the task allows, or call browser_ask_user.'
+    firstAttempt,
+    hint: r.failedChar
+      ? UNREACHABLE_CHAR_HINT
+      : 'Read the terminal with browser_read_terminal to see what is arriving. Raising delayMs will not help.'
   };
 }
 
@@ -1656,6 +1949,14 @@ async function doPressKey(run, key) {
 
   try {
     await attachDebugger(run, tab.id);
+    // A plain printable character goes through the delivery method send_keys
+    // learned for this target, so a terminal that drops "d" key events still
+    // receives it.
+    if (typeof key === 'string' && key.length === 1 && !(spec.modifiers & (MOD.ctrl | MOD.alt | MOD.meta))) {
+      const method = charMethodsFor(`${tab.id}:${run.focusFrame ?? 0}`).get(key) || 'keys';
+      await sendChar(run, tab.id, key, method);
+      return { ok: true, key, mode: 'real', method, tabId: tab.id };
+    }
     await realKey(tab.id, spec);
     return { ok: true, key, resolved: { key: spec.key, code: spec.code, modifiers: spec.modifiers }, mode: 'real', tabId: tab.id };
   } catch {}
@@ -1677,6 +1978,9 @@ async function doReadTerminal(run, maxChars) {
   try {
     const r = await sendToContent(run, tab.id, { type: 'readTerminal' });
     if (!r) return { ok: false, error: 'No response' };
+    if (r.renderer === 'xterm-canvas' && run.cfg?.supportsVision) {
+      r.visionHint = 'This terminal is drawn on a canvas, but you can still read it: call browser_screenshot and read the text from the image.';
+    }
     if (r.ok && r.text) {
       const max = Math.max(200, Math.min(20000, maxChars || 4000));
       return { ...r, text: r.text.slice(-max), truncatedFromStart: r.text.length > max };
@@ -1728,7 +2032,7 @@ async function doPageText(run, tabId, maxChars, frameId, offset) {
   try {
     const r = await sendToContent(run, targetId, { type: 'extractContent' }, { frameId: usedFrame });
     if (!r || !r.ok) return r || { ok: false, error: 'No response' };
-    const max = Math.max(500, Math.min(30000, maxChars || 6000));
+    const max = Math.max(500, Math.min(pageTextMaxChars(run.cfg), maxChars || 6000));
     const full = r.content || '';
     const start = Math.max(0, Math.min(full.length, Number(offset) || 0));
     const text = full.slice(start, start + max);
@@ -1916,6 +2220,141 @@ async function doClickText(run, text, exact) {
   const tab = await getFocusTab(run);
   if (!tab) return noFocusTab();
   return sendWithInject(run, tab.id, { type: 'clickByText', text, exact: !!exact });
+}
+
+// ---------------------------------------------------------------------------
+// Screenshots (vision models)
+// ---------------------------------------------------------------------------
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    })
+  ]).finally(() => clearTimeout(timer));
+}
+
+// Visible viewport of a tab as a downscaled JPEG, plus the CSS viewport size so
+// image coordinates can be mapped back for browser_click_at.
+// captureVisibleTab only works for the tab showing in its window; for a tab
+// in the background (parallel agents) fall back to CDP, which can time out
+// when Chrome is not painting that tab.
+async function captureTab(run, tab) {
+  let dataUrl = null;
+  let via = null;
+  let cssWidth = null;
+  let cssHeight = null;
+
+  let isShowing = false;
+  try {
+    const [active] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
+    isShowing = active?.id === tab.id;
+  } catch {}
+  if (isShowing) {
+    try {
+      dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 85 });
+      via = 'captureVisibleTab';
+    } catch {}
+  }
+  if (!dataUrl) {
+    await attachDebugger(run, tab.id);
+    const metrics = await withTimeout(cdp(tab.id, 'Page.getLayoutMetrics', {}), 5000, 'Page.getLayoutMetrics');
+    const vp = metrics?.cssVisualViewport || metrics?.visualViewport;
+    const shot = await withTimeout(
+      cdp(tab.id, 'Page.captureScreenshot', { format: 'jpeg', quality: 85, fromSurface: true }),
+      10000,
+      'Page.captureScreenshot'
+    );
+    dataUrl = `data:image/jpeg;base64,${shot.data}`;
+    via = 'cdp';
+    if (vp) {
+      cssWidth = vp.clientWidth;
+      cssHeight = vp.clientHeight;
+    }
+  }
+  if (cssWidth == null) {
+    cssWidth = tab.width;
+    cssHeight = tab.height;
+  }
+
+  const bitmap = await createImageBitmap(dataUrlToBlob(dataUrl));
+  try {
+    const full = await encodeScaled(bitmap, SCREENSHOT_MAX_SIDE, 0.75);
+    const thumb = await encodeScaled(bitmap, 360, 0.6);
+    return { dataUrl: full.dataUrl, width: full.width, height: full.height, thumbnail: thumb.dataUrl, cssWidth, cssHeight, via };
+  } finally {
+    bitmap.close?.();
+  }
+}
+
+async function doScreenshot(run) {
+  if (!run.cfg?.supportsVision) {
+    return { ok: false, error: 'Screenshots are off: the model is not marked as vision-capable in the extension settings.' };
+  }
+  const tab = await getFocusTab(run);
+  if (!tab) return noFocusTab();
+  let shot;
+  try {
+    shot = await captureTab(run, tab);
+  } catch (e) {
+    return {
+      ok: false,
+      error: `Could not capture tab ${tab.id}: ${e.message || e}`,
+      hint: 'Capturing a tab the user is not looking at can fail. Use browser_snapshot or browser_page_text, or ask the user to switch to that tab with browser_ask_user.'
+    };
+  }
+  run.lastShot = { tabId: tab.id, width: shot.width, height: shot.height, cssWidth: shot.cssWidth, cssHeight: shot.cssHeight };
+  emit(run, { type: 'agent:image', tabId: tab.id, thumbnail: shot.thumbnail, width: shot.width, height: shot.height });
+  return {
+    ok: true,
+    tabId: tab.id,
+    width: shot.width,
+    height: shot.height,
+    capturedWith: shot.via,
+    note: 'The screenshot is attached as an image in the next message. browser_click_at takes pixel coordinates in that image.',
+    _attach: {
+      text: `Screenshot of tab ${tab.id} (${truncate(tab.title || tab.url, 80)}), ${shot.width}x${shot.height}px, from browser_screenshot.`,
+      dataUrl: shot.dataUrl
+    }
+  };
+}
+
+// Real mouse click at a point of the latest screenshot. Mouse events are hit
+// tested by the browser, so this reaches iframes and canvas apps that have no
+// DOM ref.
+async function doClickAt(run, x, y, double) {
+  const tab = await getFocusTab(run);
+  if (!tab) return noFocusTab();
+  const shot = run.lastShot;
+  if (!shot || shot.tabId !== tab.id) {
+    return { ok: false, error: 'No screenshot of the focus tab yet. Call browser_screenshot first; x and y are pixels in that image.' };
+  }
+  if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x > shot.width || y > shot.height) {
+    return { ok: false, error: `(${x}, ${y}) is outside the last screenshot, which is ${shot.width}x${shot.height}px.` };
+  }
+  const cssX = (x * shot.cssWidth) / shot.width;
+  const cssY = (y * shot.cssHeight) / shot.height;
+  try {
+    await attachDebugger(run, tab.id);
+    await cdp(tab.id, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: cssX, y: cssY, button: 'none', buttons: 0 });
+    for (let clickCount = 1; clickCount <= (double ? 2 : 1); clickCount++) {
+      await cdp(tab.id, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: cssX, y: cssY, button: 'left', buttons: 1, clickCount });
+      await cdp(tab.id, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: cssX, y: cssY, button: 'left', buttons: 0, clickCount });
+    }
+  } catch (e) {
+    return { ok: false, error: `Mouse input failed: ${e.message || e}` };
+  }
+  return {
+    ok: true,
+    x,
+    y,
+    cssX: Math.round(cssX),
+    cssY: Math.round(cssY),
+    tabId: tab.id,
+    note: 'Take a new snapshot or screenshot to confirm what the click did.'
+  };
 }
 
 async function waitForTabComplete(tabId, timeoutMs) {

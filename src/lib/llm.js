@@ -3,24 +3,49 @@
 // Works with OpenAI, DeepSeek, OpenRouter, vLLM, Ollama (compat mode), etc.
 //
 // Reads API config from chrome.storage.local under key "llmConfig":
-//   { apiKey, baseUrl, model, maxContextChars }
+//   { apiKey, baseUrl, model, maxContextChars, contextWindowTokens, supportsVision, maxSteps }
+//
+// Message content may be a string or an OpenAI-style multimodal array of
+// { type: 'text', text } and { type: 'image_url', image_url: { url } } parts,
+// which vision models on OpenAI, OpenRouter, Gemini, Qwen-VL, vLLM and Ollama
+// accept. Whether images are sent at all is decided by `supportsVision`.
 //
 // Exposes:
 //   streamChat({ messages, tools, toolChoice, signal, onDelta, onToolCall, onDone, onError })
 // Returns the final assistant message.
 
+export const MIN_CONTEXT_WINDOW_TOKENS = 8000;
+export const MAX_CONTEXT_WINDOW_TOKENS = 1000000;
+// Rough request cost of one ~1280px image; OpenAI bills roughly 765–1105
+// tokens for that size, other providers are in the same range.
+export const IMAGE_TOKEN_ESTIMATE = 1100;
+
 const DEFAULTS = {
   baseUrl: 'https://api.openai.com/v1',
   model: 'gpt-4o-mini',
-  maxContextChars: 80000,
+  // 0 = derive from the context window (see pageContextChars).
+  maxContextChars: 0,
+  contextWindowTokens: 128000,
+  supportsVision: false,
   maxSteps: 40
 };
+
+const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+
+function windowTokens(cfg) {
+  const n = Number(cfg?.contextWindowTokens);
+  return Number.isFinite(n) && n > 0
+    ? clamp(Math.floor(n), MIN_CONTEXT_WINDOW_TOKENS, MAX_CONTEXT_WINDOW_TOKENS)
+    : DEFAULTS.contextWindowTokens;
+}
 
 export async function getLlmConfig() {
   return new Promise((resolve) => {
     chrome.storage.local.get(['llmConfig'], (r) => {
-      const cfg = r.llmConfig || {};
-      resolve({ ...DEFAULTS, ...cfg });
+      const cfg = { ...DEFAULTS, ...(r.llmConfig || {}) };
+      cfg.contextWindowTokens = windowTokens(cfg);
+      cfg.supportsVision = !!cfg.supportsVision;
+      resolve(cfg);
     });
   });
 }
@@ -31,6 +56,63 @@ export async function setLlmConfig(patch) {
   return new Promise((resolve) => {
     chrome.storage.local.set({ llmConfig: next }, () => resolve(next));
   });
+}
+
+// ---------------------------------------------------------------------------
+// Context budgeting
+// ---------------------------------------------------------------------------
+
+/**
+ * Cheap token estimate for a string, a multimodal content array or a whole
+ * message. ~3.5 characters per token for Latin text; CJK and other wide
+ * characters count as one token each.
+ */
+export function estimateTokens(value) {
+  if (value == null) return 0;
+  if (typeof value === 'string') {
+    let wide = 0;
+    for (let i = 0; i < value.length; i++) if (value.charCodeAt(i) > 0x2e7f) wide++;
+    return Math.ceil((value.length - wide) / 3.5 + wide);
+  }
+  if (Array.isArray(value)) {
+    let n = 0;
+    for (const part of value) {
+      if (part?.type === 'image_url') n += IMAGE_TOKEN_ESTIMATE;
+      else if (part?.type === 'text') n += estimateTokens(part.text);
+      else n += estimateTokens(JSON.stringify(part));
+    }
+    return n;
+  }
+  if (typeof value === 'object') {
+    let n = 4 + estimateTokens(value.content) + estimateTokens(value.reasoning_content);
+    if (value.tool_calls) n += estimateTokens(JSON.stringify(value.tool_calls));
+    return n;
+  }
+  return estimateTokens(String(value));
+}
+
+/** Tokens available for conversation history, leaving room for the tool
+ *  schema, the system prompt and the reply. */
+export function historyBudgetTokens(cfg) {
+  return Math.max(6000, Math.floor(windowTokens(cfg) * 0.8) - 16000);
+}
+
+/** Largest single tool result kept in the conversation (characters). */
+export function toolResultMaxChars(cfg) {
+  return clamp(Math.floor(windowTokens(cfg) * 0.05 * 3), 12000, 150000);
+}
+
+/** Cap for one browser_page_text call (characters). */
+export function pageTextMaxChars(cfg) {
+  return clamp(Math.floor(windowTokens(cfg) * 0.1 * 3), 30000, 300000);
+}
+
+/** Page text attached to a chat message (characters). About a quarter of the
+ *  window unless the user set a smaller explicit limit. */
+export function pageContextChars(cfg) {
+  const windowCap = Math.floor(windowTokens(cfg) * 0.25 * 3);
+  const n = Number(cfg?.maxContextChars);
+  return Number.isFinite(n) && n > 0 ? Math.min(n, windowCap) : windowCap;
 }
 
 /**

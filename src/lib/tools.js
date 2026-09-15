@@ -94,7 +94,7 @@ export const BROWSER_TOOLS = [
     function: {
       name: 'browser_send_keys',
       description:
-        'Send text as REAL input to whatever has focus in the FOCUS tab. This is the only way to drive terminals (lab consoles, xterm.js, term.js, AWS CloudShell), code editors and canvas apps — they ignore synthetic events, so browser_type fails on them. The whole string is pasted in one go when the target accepts that (otherwise it is typed as key events), so multi-line text such as a heredoc (cat > file <<\'EOF\' ... EOF) belongs in ONE call. The text is read back before Enter: if it did not land, Enter is withheld and the result explains why. With submit:true on a terminal it presses Enter, waits for the shell prompt to return, and returns `output` (what the command printed) plus `finished` — so do NOT call browser_read_terminal or browser_page_text afterwards unless finished is false. `verified: null` means the target could not be read back (canvas terminal). For keys and chords (Ctrl+C, Escape, arrows) use browser_press_key. For ordinary <input>/<textarea> form fields, browser_type is simpler.',
+        'Send text as REAL input to whatever has focus in the FOCUS tab. This is the only way to drive terminals (lab consoles, xterm.js, term.js, AWS CloudShell), code editors and canvas apps — they ignore synthetic events, so browser_type fails on them. The whole string is pasted in one go when the target accepts that (otherwise it is typed as key events), so multi-line text such as a heredoc (cat > file <<\'EOF\' ... EOF) belongs in ONE call. The text is read back before Enter: if it did not land, Enter is withheld and the result explains why. Terminals that drop some characters are handled automatically — it retypes one confirmed character at a time through other input methods and remembers what works — so never retry a failure with a bigger delayMs; read the error, which names the character that cannot be typed. With submit:true on a terminal it presses Enter, waits for the shell prompt to return, and returns `output` (what the command printed) plus `finished` — so do NOT call browser_read_terminal or browser_page_text afterwards unless finished is false. `verified: null` means the target could not be read back (canvas terminal). For keys and chords (Ctrl+C, Escape, arrows) use browser_press_key. For ordinary <input>/<textarea> form fields, browser_type is simpler.',
       parameters: {
         type: 'object',
         properties: {
@@ -205,7 +205,7 @@ export const BROWSER_TOOLS = [
           },
           maxChars: {
             type: 'integer',
-            description: 'Max characters to return per call (default 6000, cap 30000).'
+            description: 'Max characters to return per call (default 6000). The cap grows with the configured context window, from 30000 up to 300000.'
           },
           offset: {
             type: 'integer',
@@ -315,6 +315,32 @@ export const BROWSER_TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'browser_screenshot',
+      description:
+        'Take a screenshot of the visible part of the FOCUS tab and look at it; the image is attached to the next message. It shows everything drawn in the viewport, iframes included. Use it when the DOM does not tell you what is on screen: canvas-rendered terminals and editors (browser_read_terminal renderer "xterm-canvas"), charts, images, diagrams, or to check what a page really shows after an action behaved unexpectedly. Screenshots cost far more context than text, and only the latest three stay in context — prefer browser_snapshot or browser_page_text when they work, and do not take one every step.',
+      parameters: { type: 'object', properties: {}, additionalProperties: false }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_click_at',
+      description:
+        'Click, as real mouse input, at a point in the most recent browser_screenshot of the focus tab. x and y are pixel coordinates in that screenshot image. Use it only for targets browser_snapshot gives no [N] ref for (canvas apps, controls drawn inside images or canvases). Scrolling or navigating after the screenshot makes the coordinates wrong — take a new screenshot first.',
+      parameters: {
+        type: 'object',
+        properties: {
+          x: { type: 'integer', description: 'Horizontal pixel in the screenshot.' },
+          y: { type: 'integer', description: 'Vertical pixel in the screenshot.' },
+          double: { type: 'boolean', description: 'Double-click instead of a single click (default false).' }
+        },
+        required: ['x', 'y']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'browser_done',
       description:
         'Call this when the user task is complete. Provide a concise final answer for the user.',
@@ -345,3 +371,11 @@ export const BROWSER_TOOLS = [
 ];
 
 export const TOOL_NAME_SET = new Set(BROWSER_TOOLS.map((t) => t.function.name));
+
+// Tools that need a model which can see images.
+export const VISION_TOOL_NAMES = new Set(['browser_screenshot', 'browser_click_at']);
+
+/** The tool list for the current settings: vision tools only for vision models. */
+export function toolsFor(cfg) {
+  return cfg?.supportsVision ? BROWSER_TOOLS : BROWSER_TOOLS.filter((t) => !VISION_TOOL_NAMES.has(t.function.name));
+}

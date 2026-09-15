@@ -9,7 +9,14 @@
 // replays that run's log from the background, so an agent busy in one tab
 // never blocks chatting or starting another task in a different tab.
 
+import { getLlmConfig, pageContextChars } from '../lib/llm.js';
+import { dataUrlToBlob, encodeScaled } from '../lib/images.js';
+
 const els = {
+  attachments: document.getElementById('attachments'),
+  attach: document.getElementById('btn-attach'),
+  shot: document.getElementById('btn-shot'),
+  fileInput: document.getElementById('file-input'),
   pageContext: document.getElementById('page-context'),
   messages: document.getElementById('messages'),
   input: document.getElementById('input'),
@@ -136,8 +143,19 @@ function handleRunEvent(evt, replay) {
       onRunStart(evt);
       break;
     case 'agent:task':
-      appendAgentEntry('final', `▶ Task: ${evt.task}`);
+      appendAgentEntry('final', `▶ Task: ${evt.task}` + (evt.imageCount ? `  (📎 ${evt.imageCount} image${evt.imageCount > 1 ? 's' : ''})` : ''));
       break;
+    case 'agent:image': {
+      const e = appendAgentEntry('observation', `📷 Screenshot ${evt.width}×${evt.height}`);
+      if (evt.thumbnail) {
+        const img = document.createElement('img');
+        img.className = 'log-image';
+        img.src = evt.thumbnail;
+        img.alt = 'Screenshot the agent looked at';
+        e.appendChild(img);
+      }
+      break;
+    }
     case 'token':
       onToken(evt);
       break;
@@ -211,10 +229,11 @@ async function getPageContext() {
   try {
     const resp = await chrome.tabs.sendMessage(tab.id, { type: 'extractContent' });
     if (!resp || !resp.ok) return null;
+    const limit = pageContextChars(await getLlmConfig());
     return {
       url: resp.url,
       title: resp.title,
-      content: (resp.content || '').slice(0, 80000)
+      content: (resp.content || '').slice(0, limit)
     };
   } catch {
     return null;
@@ -301,8 +320,9 @@ function appendAskHistory(text) {
 }
 
 async function sendMessage() {
-  const text = els.input.value.trim();
-  if (!text) return;
+  const typed = els.input.value.trim();
+  const images = pendingImages.map((p) => p.dataUrl);
+  if (!typed && !images.length) return;
 
   // Snapshot the active tab id at the moment of send so the message belongs
   // to the tab the user is looking at, even if they switch mid-stream.
@@ -324,13 +344,23 @@ async function sendMessage() {
     return;
   }
 
+  if (images.length && !(await getLlmConfig()).supportsVision) {
+    onError({
+      message:
+        'Images need a vision model. Open Settings, turn on "Model supports images", and pick a model that accepts images. Your text and images are still in the composer.'
+    });
+    return;
+  }
+  const text = typed || 'Please look at the attached image(s).';
+
   els.input.value = '';
+  clearAttachments();
   els.send.disabled = true;
 
   if (currentTab === 'chat') {
-    appendMsg('user', text);
+    appendMsg('user', text, images);
     const page = await getPageContext();
-    port.postMessage({ type: 'chat:send', userText: text, page, tabId });
+    port.postMessage({ type: 'chat:send', userText: text, images, page, tabId });
   } else {
     // A new run replaces the finished one shown for this tab. The background
     // sends run:start and the task entry.
@@ -338,7 +368,7 @@ async function sendMessage() {
     currentAgentOwner = tabId;
     renderOtherRuns();
     const page = await getPageContext();
-    port.postMessage({ type: 'agent:start', task: text, page, tabId });
+    port.postMessage({ type: 'agent:start', task: text, images, page, tabId });
   }
 
   setTimeout(() => { els.send.disabled = false; }, 50);
@@ -348,7 +378,7 @@ async function sendMessage() {
 // Chat rendering
 // ---------------------------------------------------------------------------
 
-function appendMsg(role, text) {
+function appendMsg(role, text, images, imageCount) {
   const m = document.createElement('div');
   m.className = `msg ${role}`;
   if (role !== 'system' && role !== 'error') {
@@ -361,6 +391,23 @@ function appendMsg(role, text) {
   body.className = 'body';
   body.textContent = text || '';
   m.appendChild(body);
+  if (images && images.length) {
+    const strip = document.createElement('div');
+    strip.className = 'msg-images';
+    for (const src of images) {
+      const img = document.createElement('img');
+      img.src = src;
+      img.alt = 'Attached image';
+      strip.appendChild(img);
+    }
+    m.appendChild(strip);
+  } else if (imageCount) {
+    // Restored from session storage, which keeps text only.
+    const note = document.createElement('div');
+    note.className = 'msg-image-note';
+    note.textContent = `📎 ${imageCount} image${imageCount > 1 ? 's' : ''} (not kept after the extension restarts)`;
+    m.appendChild(note);
+  }
   els.messages.appendChild(m);
   els.messages.scrollTop = els.messages.scrollHeight;
   return body;
@@ -604,6 +651,107 @@ function renderOtherRuns() {
   els.otherRuns.hidden = false;
 }
 
+// ---------------------------------------------------------------------------
+// Image attachments (vision models)
+// ---------------------------------------------------------------------------
+// Attach with the 📎 button, paste, drag and drop, or 📷 to grab the visible
+// page. Images are downscaled before they are stored, so a 4K screenshot does
+// not cost several thousand image tokens.
+
+const MAX_ATTACHMENTS = 6;
+const IMAGE_MAX_SIDE = 1568;
+let pendingImages = []; // [{ dataUrl }]
+
+async function addImageBlob(blob) {
+  if (!blob || !/^image\//.test(blob.type || '')) return;
+  if (pendingImages.length >= MAX_ATTACHMENTS) {
+    onError({ message: `At most ${MAX_ATTACHMENTS} images per message.` });
+    return;
+  }
+  try {
+    const bitmap = await createImageBitmap(blob);
+    try {
+      const { dataUrl } = await encodeScaled(bitmap, IMAGE_MAX_SIDE, 0.85);
+      pendingImages.push({ dataUrl });
+    } finally {
+      bitmap.close?.();
+    }
+    renderAttachments();
+  } catch (e) {
+    onError({ message: `Could not read that image: ${e.message || e}` });
+  }
+}
+
+function renderAttachments() {
+  els.attachments.innerHTML = '';
+  pendingImages.forEach((p, i) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'attachment';
+    const img = document.createElement('img');
+    img.src = p.dataUrl;
+    img.alt = 'Attachment';
+    const remove = document.createElement('button');
+    remove.className = 'attachment-remove';
+    remove.textContent = '×';
+    remove.title = 'Remove';
+    remove.addEventListener('click', () => {
+      pendingImages.splice(i, 1);
+      renderAttachments();
+    });
+    wrap.append(img, remove);
+    els.attachments.appendChild(wrap);
+  });
+  els.attachments.hidden = pendingImages.length === 0;
+}
+
+function clearAttachments() {
+  pendingImages = [];
+  renderAttachments();
+}
+
+els.attach.addEventListener('click', () => els.fileInput.click());
+els.fileInput.addEventListener('change', async () => {
+  for (const f of Array.from(els.fileInput.files || [])) await addImageBlob(f);
+  els.fileInput.value = '';
+});
+
+els.shot.addEventListener('click', async () => {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab) return;
+    const url = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+    await addImageBlob(dataUrlToBlob(url));
+  } catch (e) {
+    onError({ message: `Screenshot failed: ${e.message || e}` });
+  }
+});
+
+els.input.addEventListener('paste', (e) => {
+  const files = Array.from(e.clipboardData?.items || [])
+    .filter((it) => it.kind === 'file' && it.type.startsWith('image/'))
+    .map((it) => it.getAsFile())
+    .filter(Boolean);
+  if (!files.length) return;
+  // Keep normal text pasting when the clipboard also carries text.
+  if (!Array.from(e.clipboardData.types || []).includes('text/plain')) e.preventDefault();
+  files.forEach((f) => addImageBlob(f));
+});
+
+const composer = document.querySelector('.composer');
+composer.addEventListener('dragover', (e) => {
+  if (Array.from(e.dataTransfer?.items || []).some((it) => it.kind === 'file')) {
+    e.preventDefault();
+    composer.classList.add('dragging');
+  }
+});
+composer.addEventListener('dragleave', () => composer.classList.remove('dragging'));
+composer.addEventListener('drop', (e) => {
+  if (!e.dataTransfer?.files?.length) return;
+  e.preventDefault();
+  composer.classList.remove('dragging');
+  Array.from(e.dataTransfer.files).forEach((f) => addImageBlob(f));
+});
+
 // Initial state
 updateInputPlaceholder();
 els.send.disabled = false;
@@ -663,7 +811,13 @@ function renderThreadMessages(messages) {
   currentAssistantMsg = null;
   for (const m of messages || []) {
     if (m.role === 'user') {
-      appendMsg('user', m.content || '');
+      if (Array.isArray(m.content)) {
+        const text = m.content.filter((p) => p?.type === 'text').map((p) => p.text).join('\n');
+        const images = m.content.filter((p) => p?.type === 'image_url').map((p) => p.image_url?.url).filter(Boolean);
+        appendMsg('user', text, images);
+      } else {
+        appendMsg('user', m.content || '', null, m.imageCount);
+      }
     } else if (m.role === 'assistant') {
       const node = appendMsg('assistant', m.content || '');
       // Mark the latest assistant as the "current" so any subsequent token

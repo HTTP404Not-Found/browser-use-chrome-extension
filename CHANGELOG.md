@@ -1,5 +1,63 @@
 # Changelog
 
+## v0.4.0 — 2026-09
+
+### Multimodal models
+
+- New setting **Model supports images (vision)**. "Test connection" then
+  also sends a small test image and reports whether the endpoint accepts it.
+- Side panel: attach images with 📎, paste them, drop them on the composer,
+  or grab the visible page with 📷. Works in Chat and as part of an Agent
+  task. Images are downscaled to 1568px and sent as OpenAI-style
+  `image_url` parts.
+- Agent: `browser_screenshot` captures the focus tab's viewport (iframes and
+  canvas-rendered terminals included) and attaches it to the conversation;
+  `browser_click_at` clicks a pixel of that screenshot with real mouse input.
+  Both are only offered to vision models. Screenshots appear as thumbnails in
+  the agent log.
+- Only the three most recent images are sent with each request.
+- Images are kept in memory only; after the extension restarts, chat history
+  shows an image count instead.
+
+### Context window up to 1M tokens
+
+- New setting **Context window (tokens)**, 8K to 1,000,000, with presets.
+- It drives the budgets: page text attached to chats (about a quarter of the
+  window unless "Max page context chars" is set lower), the size of a single
+  tool result (12K–150K chars), the `browser_page_text` cap (30K–300K chars),
+  and how much agent history stays verbatim. Tool results are now summarized
+  only once the history no longer fits, instead of always after six.
+- Long chats drop their oldest turns, then shorten the page context, to fit.
+
+## v0.3.1 — 2026-09
+
+### Terminals that drop characters
+
+The Vocareum lab terminal consistently swallowed the key events for some
+letters (`sudo` → `uo`, `install` → `intll`, `pwd` → `pw`), even one key per
+step, so v0.3.0's retries could never succeed.
+
+- Characters are now typed the way Playwright and browser-use do it:
+  `rawKeyDown` without text, a separate `char` event with the text, `keyUp`,
+  and no `nativeVirtualKeyCode`.
+- If a line comes back mangled, it is cleared and typed again one character
+  at a time. Each character is confirmed on screen; one that does not land is
+  re-sent as a bare `char` event, then `Input.insertText`, then a synthetic
+  event. The method that works is remembered per tab and frame, so later
+  sends (and `browser_press_key` for single characters) are fast.
+- Checks are anchored to the prompt, so a character that arrives twice is
+  caught and removed with Backspace.
+- Multi-line text in key-event mode is always typed with per-character
+  confirmation, since newlines cannot be undone.
+- If a character never arrives by any method, the error names it and
+  suggests avoiding it in bash with `$'\xNN'`.
+- Fixed: after a failed attempt the retry compared against a screen that
+  still held the mangled text and reported "nothing changed". The line is
+  now cleared and confirmed before retrying.
+- The loop guard no longer flags reads whose text changed.
+- The prompt tells the agent not to retry with a larger `delayMs`, and not
+  to navigate the lab tab to an iframe URL (use `browser_new_tab`).
+
 ## v0.3.0 — 2026-09
 
 ### Parallel agents, one per tab

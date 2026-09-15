@@ -233,7 +233,9 @@ function extractContent() {
     url: location.href,
     isTop: window.top === window.self,
     fullLength: text.length,
-    content: text.slice(0, 200000)
+    // Large enough for a 1M-token context window; callers cut it down to
+    // what the configured window allows.
+    content: text.slice(0, 4000000)
   };
 }
 

@@ -39,6 +39,7 @@ label:last-child { margin-bottom: 0; }
   letter-spacing: 0.04em;
 }
 
+select,
 input[type="text"],
 input[type="password"],
 input[type="number"] {
@@ -67,6 +68,7 @@ code {
 }
 
 .row { display: flex; gap: 10px; }
+.row select { width: 110px; flex-shrink: 0; }
 button {
   padding: 10px 16px;
   border-radius: 8px;

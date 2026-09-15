@@ -32,7 +32,11 @@
             <option value="gpt-4o-mini"></option>
             <option value="gpt-4o"></option>
             <option value="gpt-4.1"></option>
+            <option value="gpt-4.1-mini"></option>
             <option value="o4-mini"></option>
+            <option value="gemini-2.5-pro"></option>
+            <option value="gemini-2.5-flash"></option>
+            <option value="qwen-vl-max"></option>
             <option value="deepseek-chat"></option>
             <option value="qwen-plus"></option>
             <option value="claude-3-5-sonnet-latest"></option>
@@ -41,9 +45,31 @@
         </label>
 
         <label>
+          <span class="label">Context window (tokens)</span>
+          <div class="row">
+            <select id="ctx-preset">
+              <option value="32000">32K</option>
+              <option value="128000">128K</option>
+              <option value="200000">200K</option>
+              <option value="400000">400K</option>
+              <option value="1000000">1M</option>
+              <option value="custom">Custom</option>
+            </select>
+            <input type="number" id="ctx-window" min="8000" max="1000000" step="1000" />
+          </div>
+          <small>Set this to your model's real context size, up to <code>1000000</code>. It decides how much page text is attached and how much agent history is sent verbatim before older steps are summarized. A bigger window keeps more detail, but every step sends more tokens, so it is slower and costs more. Setting it above what the model supports makes requests fail.</small>
+        </label>
+
+        <label class="inline">
+          <input type="checkbox" id="vision" />
+          <span class="label">Model supports images (vision)</span>
+          <small>Turn on for multimodal models (for example gpt-4o, gpt-4.1, Gemini, Qwen-VL). Lets you attach, paste or drop images and page screenshots in the side panel, and gives the agent <code>browser_screenshot</code> and <code>browser_click_at</code>.</small>
+        </label>
+
+        <label>
           <span class="label">Max page context chars</span>
-          <input type="number" id="max-ctx" min="4000" max="200000" step="1000" />
-          <small>How many characters of the current page to send to the model. Larger is more accurate, smaller is cheaper.</small>
+          <input type="number" id="max-ctx" min="0" max="4000000" step="1000" placeholder="0 = auto" />
+          <small>Characters of the current page attached to a chat message. <code>0</code> = automatic (about a quarter of the context window). A larger explicit value is still capped by the context window.</small>
         </label>
 
         <label>
@@ -74,6 +100,8 @@
           <li>For DeepSeek, set base URL to <code>https://api.deepseek.com/v1</code> and model to <code>deepseek-chat</code>.</li>
           <li>For OpenRouter, use <code>https://openrouter.ai/api/v1</code> and your model slug.</li>
           <li>For a local Ollama model, use <code>http://localhost:11434/v1</code> with any tool-capable model.</li>
+          <li>For images, use a vision model and turn on "Model supports images". "Test connection" then also sends a small test image.</li>
+          <li>Models such as GPT-4.1 and Gemini 2.5 Pro accept about 1M tokens; many others accept 128K–200K. Check your provider's documentation.</li>
           <li>Restart the side panel after saving for changes to apply.</li>
         </ul>
       </section>
