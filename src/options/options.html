@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Browser Use — Settings</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main class="container">
+      <header>
+        <h1>Browser Use — Settings</h1>
+        <p>Configure your AI provider. Any OpenAI-compatible endpoint works (OpenAI, DeepSeek, OpenRouter, vLLM, Ollama, etc.).</p>
+      </header>
+
+      <section class="card">
+        <label>
+          <span class="label">API key</span>
+          <input type="password" id="api-key" placeholder="sk-..." autocomplete="off" />
+          <small>Stored locally via chrome.storage. Never sent anywhere except your chosen endpoint.</small>
+        </label>
+
+        <label>
+          <span class="label">Base URL</span>
+          <input type="text" id="base-url" placeholder="https://api.openai.com/v1" />
+          <small>The endpoint root. We append <code>/chat/completions</code>.</small>
+        </label>
+
+        <label>
+          <span class="label">Model</span>
+          <input type="text" id="model" placeholder="gpt-4o-mini" list="model-list" />
+          <datalist id="model-list">
+            <option value="gpt-4o-mini"></option>
+            <option value="gpt-4o"></option>
+            <option value="gpt-4.1"></option>
+            <option value="o4-mini"></option>
+            <option value="deepseek-chat"></option>
+            <option value="qwen-plus"></option>
+            <option value="claude-3-5-sonnet-latest"></option>
+            <option value="gemini-2.0-flash"></option>
+          </datalist>
+        </label>
+
+        <label>
+          <span class="label">Max page context chars</span>
+          <input type="number" id="max-ctx" min="4000" max="200000" step="1000" />
+          <small>How many characters of the current page to send to the model. Larger is more accurate, smaller is cheaper.</small>
+        </label>
+
+        <label>
+          <span class="label">Max agent steps</span>
+          <input type="number" id="max-steps" min="0" step="5" placeholder="0 = unlimited" />
+          <small>How many tool calls a single agent run may make before it gives up. Set to <code>0</code> (or leave blank) for <strong>unlimited</strong>. The agent also stops when it calls <code>browser_done</code>, when it asks you a question, or when the loop guard fires.</small>
+        </label>
+
+        <label class="inline">
+          <input type="checkbox" id="show-badge" />
+          <span class="label">Show the "BU" badge on pages</span>
+          <small>Off by default. Only ever drawn on the top document, never inside iframes.</small>
+        </label>
+      </section>
+
+      <section class="card">
+        <div class="row">
+          <button id="test" class="secondary">Test connection</button>
+          <button id="save" class="primary">Save</button>
+        </div>
+        <div id="status" class="status"></div>
+      </section>
+
+      <section class="card hint">
+        <h3>Tips</h3>
+        <ul>
+          <li>For tool calling (the Agent tab), pick a model that supports function calling (e.g. <code>gpt-4o-mini</code>, <code>deepseek-chat</code>, <code>qwen-plus</code>).</li>
+          <li>For DeepSeek, set base URL to <code>https://api.deepseek.com/v1</code> and model to <code>deepseek-chat</code>.</li>
+          <li>For OpenRouter, use <code>https://openrouter.ai/api/v1</code> and your model slug.</li>
+          <li>For a local Ollama model, use <code>http://localhost:11434/v1</code> with any tool-capable model.</li>
+          <li>Restart the side panel after saving for changes to apply.</li>
+        </ul>
+      </section>
+    </main>
+
+    <script src="options.js" type="module"></script>
+  </body>
+</html>
